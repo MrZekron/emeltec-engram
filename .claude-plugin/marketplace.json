@@ -1,18 +1,18 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "engram",
-  "description": "Persistent memory for AI coding agents — agent-agnostic, single binary, zero dependencies",
+  "name": "emeltec",
+  "description": "Marketplace interno de Emeltec — plugins de agentes personalizados para el equipo",
   "owner": {
-    "name": "Gentleman Programming",
-    "email": "gentlemanprogramming.dev@gmail.com"
+    "name": "Emeltec",
+    "email": "cidm3965@gmail.com"
   },
   "plugins": [
     {
-      "name": "engram",
-      "description": "Persistent memory with session tracking, compaction recovery, and Memory Protocol. Gives Claude a brain that survives across sessions.",
+      "name": "emeltec-engram",
+      "description": "Memoria persistente de Emeltec: tracking de sesion, recuperacion post-compactacion y Protocolo de Memoria. Fork interno de Engram (Gentleman Programming) personalizado para el equipo.",
       "version": "0.1.2",
       "author": {
-        "name": "Gentleman Programming"
+        "name": "Emeltec"
       },
       "source": "./plugin/claude-code",
       "category": "productivity",

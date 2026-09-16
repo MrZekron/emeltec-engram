@@ -1,9 +1,10 @@
 {
-  "name": "engram",
-  "description": "Persistent memory for AI coding agents. Survives across sessions and compactions.",
+  "name": "emeltec-engram",
+  "description": "Memoria persistente de Emeltec para agentes de codigo. Sobrevive entre sesiones y compactaciones. Fork interno de Engram (Gentleman Programming).",
   "version": "0.1.2",
   "author": {
-    "name": "Gentleman Programming"
+    "name": "Emeltec",
+    "email": "cidm3965@gmail.com"
   },
   "homepage": "https://github.com/Gentleman-Programming/engram",
   "repository": "https://github.com/Gentleman-Programming/engram",
