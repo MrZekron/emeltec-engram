@@ -10,7 +10,7 @@
     {
       "name": "emeltec-engram",
       "description": "Memoria persistente de Emeltec: tracking de sesion, recuperacion post-compactacion y Protocolo de Memoria. Fork interno de Engram (Gentleman Programming) personalizado para el equipo.",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "author": {
         "name": "Emeltec"
       },
