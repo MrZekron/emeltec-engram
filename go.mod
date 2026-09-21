@@ -1,6 +1,6 @@
 module github.com/Gentleman-Programming/engram/v2
 
-go 1.25.10
+go 1.26.0
 
 require (
 	github.com/a-h/templ v0.3.1001
@@ -10,7 +10,7 @@ require (
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/mark3labs/mcp-go v0.44.0
 	golang.org/x/net v0.52.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/sys v0.48.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.45.0
 )
