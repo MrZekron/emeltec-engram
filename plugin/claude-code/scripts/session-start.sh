@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# Engram — SessionStart hook for Claude Code
+#
+# 1. Ensures the engram server is running
+# 2. Creates a session in engram
+# 3. Auto-imports git-synced chunks if .engram/manifest.json exists
+# 4. Injects Memory Protocol instructions + memory context
+
+IMPORT_TIMEOUT_SECS=8
+LOCK_TTL_SECS=$((IMPORT_TIMEOUT_SECS + 4))
+LOCK_METADATA_STALE_SECS=$((LOCK_TTL_SECS * 5))
+
+# Load shared helpers
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/_helpers.sh"
+
+# Read hook input from stdin
+INPUT=$(cat)
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+
+MCP_CONFIG="$(claude_config_root)/mcp/engram.json"
+if [ ! -f "$MCP_CONFIG" ] || [ -L "$MCP_CONFIG" ]; then
+  if engram setup claude-code --mcp-only; then
+    printf '%s\n' "Engram MCP registration migrated. Restart Claude Code to enable MCP tools."
+  else
+    printf "warning: Engram MCP registration migration failed; manually replace %s with a regular file, then run 'engram setup claude-code'.\n" "$MCP_CONFIG" >&2
+  fi
+fi
+# An explicit URL is an external-server opt-in. Only the default local endpoint
+# is owned by this data directory, so reachability alone is never sufficient.
+if [ "${ENGRAM_MANAGED_LOCAL:-0}" = 1 ]; then
+  ENGRAM_INSTANCE_ID=$(engram instance-id 2>/dev/null) || {
+    printf '%s\n' "warning: Engram could not resolve its local server identity." >&2
+    exit 0
+  }
+if ! engram_health_matches_instance "$ENGRAM_INSTANCE_ID"; then
+  ENGRAM_SERVE_DATA_DIR="${ENGRAM_DATA_DIR:-$HOME/.engram}"
+  if mkdir -p "$ENGRAM_SERVE_DATA_DIR" 2>/dev/null && : >> "$ENGRAM_SERVE_DATA_DIR/serve.err.log" 2>/dev/null; then
+    ENGRAM_SERVE_ERR_LOG="$ENGRAM_SERVE_DATA_DIR/serve.err.log"
+  else
+    ENGRAM_SERVE_ERR_LOG="${TMPDIR:-/tmp}/engram-serve.err.log"
+  fi
+  ENGRAM_CLOUD_AUTOSYNC=1 engram serve > /dev/null 2>> "$ENGRAM_SERVE_ERR_LOG" &
+  sleep 0.5
+fi
+if ! engram_health_matches_instance "$ENGRAM_INSTANCE_ID"; then
+  printf '%s\n' "warning: Engram server ownership mismatch; use ENGRAM_URL, ENGRAM_PORT, or ENGRAM_SOCKET to isolate it." >&2
+  exit 0
+fi
+fi
+
+PROJECT=$(resolve_project "$CWD") || PROJECT=""
+
+# Create session
+if [ -n "$SESSION_ID" ] && [ -n "$PROJECT" ]; then
+  engram_curl -sf "${ENGRAM_URL}/sessions" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg id "$SESSION_ID" --arg project "$PROJECT" --arg dir "$CWD" \
+      '{id: $id, project: $project, directory: $dir}')" \
+    > /dev/null
+fi
+
+# Auto-import git-synced chunks
+if [ -f "${CWD}/.engram/manifest.json" ]; then
+  (
+    cd "$CWD" 2>/dev/null || exit 0
+    IMPORT_LOCK="/tmp/engram-sync-import-$(printf '%s' "$CWD" | cksum | cut -d ' ' -f 1).lock"
+    write_import_lock_info() {
+      LOCK_INFO_TMP="$IMPORT_LOCK/info.$$"
+      printf '%s %s\n' "$LOCK_PID" "$LOCK_NOW" > "$LOCK_INFO_TMP" 2>/dev/null \
+        && mv "$LOCK_INFO_TMP" "$IMPORT_LOCK/info" 2>/dev/null
+    }
+    lock_path_age_secs() {
+      LOCK_PATH=$1
+      LOCK_MTIME=""
+      if LOCK_MTIME=$(stat -f %m "$LOCK_PATH" 2>/dev/null); then
+        :
+      elif LOCK_MTIME=$(stat -c %Y "$LOCK_PATH" 2>/dev/null); then
+        :
+      else
+        return 1
+      fi
+      case "$LOCK_MTIME" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      printf '%s\n' $(( LOCK_NOW - LOCK_MTIME ))
+    }
+    lock_metadata_is_stale() {
+      LOCK_METADATA_PATH=$1
+      LOCK_METADATA_AGE=$(lock_path_age_secs "$LOCK_METADATA_PATH") || return 1
+      [ "$LOCK_METADATA_AGE" -gt "$LOCK_METADATA_STALE_SECS" ]
+    }
+    acquire_import_lock() {
+      LOCK_PID="${BASHPID:-$$}"
+      LOCK_NOW=$(date +%s)
+      if mkdir "$IMPORT_LOCK" 2>/dev/null; then
+        write_import_lock_info || true
+        return 0
+      fi
+
+      LOCK_INFO=""
+      if [ -f "$IMPORT_LOCK/info" ]; then
+        LOCK_INFO=$(cat "$IMPORT_LOCK/info" 2>/dev/null || true)
+      fi
+      read -r OLD_PID OLD_EPOCH LOCK_INFO_EXTRA <<< "$LOCK_INFO"
+      STALE_LOCK=0
+      if [ -z "$LOCK_INFO" ] || [ -z "$OLD_PID" ] || [ -z "$OLD_EPOCH" ] || [ -n "$LOCK_INFO_EXTRA" ]; then
+        lock_metadata_is_stale "$IMPORT_LOCK" || return 1
+        STALE_LOCK=1
+      elif [[ "$OLD_PID" == *[!0-9]* ]] || [[ "$OLD_EPOCH" == *[!0-9]* ]]; then
+        lock_metadata_is_stale "$IMPORT_LOCK/info" || return 1
+        STALE_LOCK=1
+      elif kill -0 "$OLD_PID" 2>/dev/null; then
+        return 1
+      elif [ $(( LOCK_NOW - OLD_EPOCH )) -gt "$LOCK_TTL_SECS" ]; then
+        STALE_LOCK=1
+      fi
+
+      if [ "$STALE_LOCK" -ne 1 ]; then
+        return 1
+      fi
+      rm -f "$IMPORT_LOCK/info" 2>/dev/null || true
+      rmdir "$IMPORT_LOCK" 2>/dev/null || return 1
+      if mkdir "$IMPORT_LOCK" 2>/dev/null; then
+        write_import_lock_info || true
+        return 0
+      fi
+      return 1
+    }
+    if ! acquire_import_lock; then
+      exit 0
+    fi
+    trap 'rm -f "$IMPORT_LOCK/info" 2>/dev/null || true; rmdir "$IMPORT_LOCK" 2>/dev/null || true' EXIT
+    if command -v timeout >/dev/null 2>&1; then
+      timeout "${IMPORT_TIMEOUT_SECS}s" engram sync --import >/dev/null 2>&1 || true
+    else
+      engram sync --import >/dev/null 2>&1 &
+      IMPORT_PID=$!
+      (sleep "$IMPORT_TIMEOUT_SECS"; kill "$IMPORT_PID" 2>/dev/null || true) &
+      WAITER_PID=$!
+      wait "$IMPORT_PID" 2>/dev/null || true
+      kill "$WAITER_PID" 2>/dev/null || true
+    fi
+  ) >/dev/null 2>&1 &
+fi
+
+# Fetch memory context.
+#
+# compact=1 renders observation bullets as `- [type] **title**` instead of
+# appending 300 chars of body: no row disappears, only the inline preview,
+# and the body is one mem_get_observation away when the agent actually wants
+# it. pinned=20 puts a ceiling on the one section that never had one.
+# max_bytes=16384 caps the final injected context without changing its defaults.
+CONTEXT=""
+if [ -n "$PROJECT" ]; then
+  ENCODED_PROJECT=$(printf '%s' "$PROJECT" | jq -sRr @uri)
+  CONTEXT=$(engram_curl -sf "${ENGRAM_URL}/context?project=${ENCODED_PROJECT}&compact=1&pinned=20&max_bytes=16384" --max-time 3 | jq -r '.context // empty' 2>/dev/null)
+fi
+
+# Resolve protocol verbosity mode for this slug. All slim/full branching
+# (including the engram-version floor check) lives in Go — see `engram
+# protocol-mode`. A missing/old engram binary or an unrecognized subcommand
+# never yields "slim" here, so this always defaults safely to full. $mode is
+# NEVER echoed/logged to this hook's own stdout.
+mode=$(engram protocol-mode claude-code 2>/dev/null)
+if [ "$mode" != "slim" ]; then
+  mode="full"
+fi
+
+# Inject Memory Protocol + context — stdout goes to Claude as additionalContext
+if [ "$mode" != "slim" ]; then
+cat <<'PROTOCOL'
+## Emeltec Engram — ACTIVE PROTOCOL
+
+### DISEÑO DE MARCA EN INFORMES (mandatory)
+Todo informe/documento/reporte para Emeltec (Artifact, PDF, presentación, etc.) sigue el manual assets/brand/manual-marca-emeltec.pdf del repo:
+- Color primario Pantone 7707C #005f7f (azul); color secundario Pantone Cool Gray 7C #98989a (gris).
+- Logo wordmark "emeltec" minúsculas + tagline "EXPERIENCIA & FLEXIBILIDAD"; versión positiva en fondo claro, negativa (blanca) en fondo oscuro; nunca alterar colores/tipografía del logo.
+- Isotipo secundario (diamante/hexágono) opcional, solo portadas/carpetas.
+- Tipografía complementaria "Andis" Regular/Bold; si no disponible, sans-serif neutra similar (Montserrat/Poppins).
+- Layout: fondo claro, logo emeltec en pie de página, acentos de color primario en franjas/detalles — nunca como fondo dominante.
+- No deformar/desproporcionar el logo, no alterar distancia logo-isotipo, respetar espacio de protección.
+- Si es texto plano sin formato de documento, igual aplicar tono/idioma y mencionar que el diseño de marca se puede aplicar si el formato lo permite.
+
+### SALUDO DE SESIÓN (obligatorio, una sola vez al inicio)
+Antes de cualquier otra cosa, tu primer mensaje de esta sesión debe comenzar
+con la línea exacta: "Hola, soy Emeltito." — luego continuar normalmente con
+la respuesta al usuario. No repetir el saludo en mensajes siguientes de la
+misma sesión.
+
+You have engram memory tools. This protocol is MANDATORY and ALWAYS ACTIVE.
+
+### REGLAS UNIVERSALES — SEGURIDAD Y DATOS SENSIBLES (mandatory, todos los proyectos)
+- Nunca imprimir, loguear, commitear ni guardar en memoria credenciales, tokens, API keys, contraseñas o secretos — ni siquiera parcialmente.
+- Antes de cada mem_save, revisar que el contenido no incluya datos sensibles de clientes (nombres completos, DNI/CUIT, direcciones, tarjetas, contraseñas); si aparecen, omitirlos o generalizarlos.
+- No subir código, logs ni datos de clientes a servicios externos (pastebins, gists, artifacts públicos) sin autorización explícita puntual del usuario.
+- Toda acción destructiva o irreversible (borrar archivos, DROP de base de datos, force push, revocar accesos, eliminar backups) requiere confirmación explícita antes de ejecutarse.
+- Si se detecta un .env, clave privada o certificado a punto de subirse a git o compartirse, avisar antes de continuar.
+- Ante sospecha de filtración o exposición de credenciales, avisar de inmediato antes de seguir con cualquier otra tarea.
+
+### FORMATO DE COMUNICACIÓN (mandatory)
+- Amable en la forma, técnico en el fondo: la amabilidad nunca diluye la precisión técnica del área consultada.
+- Usar terminología correcta y específica del área que se pregunte (backend, frontend, redes, infraestructura, seguridad, base de datos, etc.).
+- Adaptar el nivel de detalle al área solicitada — responder con la profundidad técnica que esa área requiere, no un resumen genérico.
+- Amabilidad = forma de decirlo (sin culpar, con alternativa); nunca = imprecisión, vaguedad o evitar el término técnico correcto.
+- Al sugerir una mejora (arquitectura, librería, enfoque, refactor), mostrar siempre lo bueno y lo malo de esa mejora — nunca solo ventajas. Formato mínimo: qué gana, qué cuesta/arriesga, cuándo conviene.
+
+### CORE TOOLS — always available, no ToolSearch needed
+mem_save, mem_search, mem_context, mem_session_summary, mem_get_observation, mem_save_prompt, mem_current_project, mem_judge, mem_compare
+
+Use ToolSearch for other tools: mem_update, mem_review, mem_pin, mem_unpin, mem_suggest_topic_key, mem_session_start, mem_session_end, mem_doctor, mem_capture_passive
+
+### PROACTIVE SAVE — do NOT wait for user to ask
+Call `mem_save` IMMEDIATELY after ANY of these:
+- Decision made (architecture, convention, workflow, tool choice)
+- Bug fixed (include root cause)
+- Convention or workflow documented/updated
+- Notion/Jira/GitHub artifact created or updated with significant content
+- Non-obvious discovery, gotcha, or edge case found
+- Pattern established (naming, structure, approach)
+- User preference or constraint learned
+- Feature implemented with non-obvious approach
+- User confirms your recommendation ("go with that", "sounds good", or the equivalent in the user's language)
+- User rejects an approach or expresses a preference ("no, better X", "I prefer X", or the equivalent in the user's language)
+- Discussion concludes with a clear direction chosen
+
+**Self-check after EVERY task**: "Did I or the user just make a decision, confirm a recommendation, express a preference, fix a bug, learn something, or establish a convention? If yes → mem_save NOW."
+
+### DELIVERY GUARANTEE
+Memory operations are internal bookkeeping, never the user-facing answer. Complete required memory work before composing the completed-task reply; send the complete answer as the final message of the turn with no later tool calls. If memory work fails or needs follow-up, still send the answer.
+
+### SEARCH MEMORY when:
+- User asks to recall anything ("remember", "what did we do", or the equivalent in the user's language)
+- Starting work on something that might have been done before
+- User mentions a topic you have no context on
+- User's FIRST message references the project, a feature, or a problem — call `mem_search` with keywords from their message to check for prior work before responding
+
+### SESSION CLOSE — before saying "done":
+Call `mem_session_summary` with: Goal, Discoveries, Accomplished, Next Steps, Relevant Files.
+PROTOCOL
+fi
+
+# Inject memory context if available
+if [ -n "$CONTEXT" ]; then
+  printf "\n%s\n" "$CONTEXT"
+fi
+
+exit 0
